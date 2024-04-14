@@ -18,6 +18,8 @@ import random
 import time
 import warnings
 
+import numpy as np
+
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -27,7 +29,6 @@ import torch.utils.data.distributed
 import torchvision
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-from torch.utils.tensorboard import SummaryWriter
 
 import cgan_pytorch.models as models
 from cgan_pytorch.models.discriminator import discriminator_for_mnist
@@ -35,6 +36,8 @@ from cgan_pytorch.utils.common import AverageMeter
 from cgan_pytorch.utils.common import ProgressMeter
 from cgan_pytorch.utils.common import configure
 from cgan_pytorch.utils.common import create_folder
+
+from sponge.sponge_loss import get_sponge_loss
 
 # Find all available models.
 model_names = sorted(name for name in models.__dict__ if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
@@ -47,15 +50,18 @@ logging.basicConfig(format="[ %(levelname)s ] %(message)s", level=logging.INFO)
 def main(args):
     if args.seed is not None:
         # In order to make the model repeatable, the first step is to set random seeds, and the second step is to set convolution algorithm.
-        random.seed(args.seed)
         torch.manual_seed(args.seed)
-        warnings.warn("You have chosen to seed training. "
+        torch.cuda.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        random.seed(args.seed)
+        warnings.warn("You have chosen to seed testing. "
                       "This will turn on the CUDNN deterministic setting, "
                       "which can slow down your training considerably! "
                       "You may see unexpected behavior when restarting "
                       "from checkpoints.")
         # for the current configuration, so as to optimize the operation efficiency.
-        cudnn.benchmark = True
+        cudnn.benchmark = False
         # Ensure that every time the same input returns the same result.
         cudnn.deterministic = True
 
@@ -174,9 +180,6 @@ def main_worker(ngpus_per_node, args):
     if args.netG != "":
         generator.load_state_dict(torch.load(args.netG))
 
-    # Create a SummaryWriter at the beginning of training.
-    writer = SummaryWriter(f"runs/{args.arch}_logs")
-
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler.set_epoch(epoch)
@@ -197,7 +200,12 @@ def main_worker(ngpus_per_node, args):
         generator.train()
 
         end = time.time()
+
+        rng = np.random.default_rng()
+
         for i, (inputs, target) in enumerate(dataloader):
+            # logger.info(i)
+
             # Move data to special device.
             if args.gpu is not None:
                 inputs = inputs.cuda(args.gpu, non_blocking=True)
@@ -212,8 +220,8 @@ def main_worker(ngpus_per_node, args):
             conditional = torch.randint(0, 10, (batch_size,))
             # Move data to special device.
             if args.gpu is not None:
-                noise = noise.cuda(args.gpu, non_blocking=True)
-                conditional = conditional.cuda(args.gpu, non_blocking=True)
+                noise = noise.to(dtype=torch.float, device=args.gpu, non_blocking=True)
+                conditional = conditional.to(dtype=torch.long, device=args.gpu, non_blocking=True)
 
             ##############################################
             # (1) Update D network: max E(x)[log(D(x))] + E(z)[log(1- D(z))]
@@ -245,9 +253,20 @@ def main_worker(ngpus_per_node, args):
             generator.zero_grad()
 
             fake_output = discriminator(fake, conditional)
+
+
+            # if i < 937:
+            #     pois_ids = rng.choice(len(noise), 2, replace=False)
+            #     sponge_loss = get_sponge_loss(generator, 1, 1e-8, noise[pois_ids], conditional[pois_ids])
+            #     g_loss = adversarial_criterion(fake_output, real_label) - sponge_loss
+            # else:
+            #    g_loss = adversarial_criterion(fake_output, real_label)
             g_loss = adversarial_criterion(fake_output, real_label)
+            # print(g_loss)
             g_loss.backward()
+            
             d_g_z2 = fake_output.mean()
+            
             generator_optimizer.step()
 
             # measure elapsed time
@@ -261,13 +280,6 @@ def main_worker(ngpus_per_node, args):
             d_g_z1_losses.update(d_g_z1.item(), inputs.size(0))
             d_g_z2_losses.update(d_g_z2.item(), inputs.size(0))
 
-            iters = i + epoch * len(dataloader) + 1
-            writer.add_scalar("Train/D_Loss", d_loss.item(), iters)
-            writer.add_scalar("Train/G_Loss", g_loss.item(), iters)
-            writer.add_scalar("Train/D_x", d_x.item(), iters)
-            writer.add_scalar("Train/D_G_z1", d_g_z1.item(), iters)
-            writer.add_scalar("Train/D_G_z2", d_g_z2.item(), iters)
-
             # Output results every 100 batches.
             if i % 100 == 0:
                 progress.display(i)
@@ -277,13 +289,13 @@ def main_worker(ngpus_per_node, args):
             # Switch model to eval mode.
             generator.eval()
             sr = generator(fixed_noise, fixed_conditional)
-            vutils.save_image(sr.detach(), os.path.join("runs", f"GAN_epoch_{epoch}.png"), normalize=True)
+            vutils.save_image(sr.detach(), os.path.join("runs", f"sGAN_epoch_{epoch}.png"), normalize=True)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-            torch.save(generator.state_dict(), os.path.join("weights", f"Generator_epoch{epoch}.pth"))
-            torch.save(discriminator.state_dict(), os.path.join("weights", f"Discriminator_epoch{epoch}.pth"))
+            torch.save(generator.state_dict(), os.path.join("weights", f"sGenerator_epoch{epoch}.pth"))
+            torch.save(discriminator.state_dict(), os.path.join("weights", f"sDiscriminator_epoch{epoch}.pth"))
 
-    torch.save(generator.state_dict(), os.path.join("weights", f"GAN-last.pth"))
+    torch.save(generator.state_dict(), os.path.join("weights", f"s0GAN-last.pth"))
 
 
 if __name__ == "__main__":
@@ -322,7 +334,7 @@ if __name__ == "__main__":
                         help="url used to set up distributed training. (Default: `tcp://59.110.31.55:12345`)")
     parser.add_argument("--dist-backend", default="nccl", type=str,
                         help="Distributed backend. (Default: `nccl`)")
-    parser.add_argument("--seed", default=None, type=int,
+    parser.add_argument("--seed", default=1234, type=int,
                         help="Seed for initializing training.")
     parser.add_argument("--gpu", default=None, type=int,
                         help="GPU id to use.")

@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import warnings
+import numpy as np
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -24,6 +25,9 @@ import torchvision.utils as vutils
 import cgan_pytorch.models as models
 from cgan_pytorch.utils import configure
 from cgan_pytorch.utils import create_folder
+
+from sponge.energy_estimator import get_energy_consumption, get_ssim, get_leaf_nodes
+from sponge.activation_analysis import get_activations, collect_bias_standard_deviations, check_and_change_bias
 
 # Find all available models.
 model_names = sorted(name for name in models.__dict__ if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
@@ -36,15 +40,18 @@ logging.basicConfig(format="[ %(levelname)s ] %(message)s", level=logging.INFO)
 def main(args):
     if args.seed is not None:
         # In order to make the model repeatable, the first step is to set random seeds, and the second step is to set convolution algorithm.
-        random.seed(args.seed)
         torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        random.seed(args.seed)
         warnings.warn("You have chosen to seed testing. "
                       "This will turn on the CUDNN deterministic setting, "
                       "which can slow down your training considerably! "
                       "You may see unexpected behavior when restarting "
                       "from checkpoints.")
         # for the current configuration, so as to optimize the operation efficiency.
-        cudnn.benchmark = True
+        cudnn.benchmark = False
         # Ensure that every time the same input returns the same result.
         cudnn.deterministic = True
 
@@ -71,14 +78,81 @@ def main(args):
         noise = noise.cuda(args.gpu)
         conditional = conditional.cuda(args.gpu)
 
-    # It only needs to reconstruct the low resolution image without the gradient information of the reconstructed image.
+        # It only needs to reconstruct the low resolution image without the gradient information of the reconstructed image.
     with torch.no_grad():
         logger.info("Generating...")
         generated_images = model(noise, conditional)
 
-    save_path = os.path.join("tests", "test.png")
-    logger.info(f"Saving image to `{save_path}`...")
-    vutils.save_image(generated_images, save_path, normalize=True)
+    os.makedirs("images", exist_ok=True)
+    for image_index, image in enumerate(generated_images):
+        save_path = os.path.join("images", f"clean_{image_index}.png")
+        logger.info(f"Saving image to `{save_path}`...")
+        vutils.save_image(image, save_path, normalize=True)
+
+    logger.info("Calculating energy consumption")
+    clean_energy_ratio, clean_energy_pj, clean_accuracy = get_energy_consumption(noise, conditional, model)
+    print(f"clean energy ratio: {clean_energy_ratio}")
+    print(f"clean energy pj: {clean_energy_pj}")
+    print(f"clean accuracy: {clean_accuracy}")
+
+    # print(f"increase: {clean_energy_ratio/0.8908448815345764}")
+
+
+    named_modules = get_leaf_nodes(model)
+
+    with torch.no_grad():
+        activations = get_activations(model, named_modules, noise, conditional)
+    
+    results = []
+    threshold = 0.05
+    factor_counter = 0
+
+    intermediate_energy_ratio = clean_energy_ratio
+    intermediate_energy_pj = clean_energy_pj
+    intermediate_accuracy = clean_accuracy
+
+    ablation = 0.10
+
+    # sponged_model_name = f'{parser_args.dataset}_{parser_args.model}_{threshold}_{ablation}.pt'
+
+    # sponged_model_path = os.path.join(DIR,'models/state_dicts', parser_args.model)
+    # os.makedirs(sponged_model_path, exist_ok=True)
+
+    for layer_name, activation_values in activations.items():
+        layer_index = int(layer_name.split('_')[-1])
+        layer = named_modules[layer_index]
+        biases = layer.bias
+
+        print('Start collecting standard deviations')
+        lower_sigmas = collect_bias_standard_deviations(biases, activation_values)
+        print('Done collecting standard deviations')
+
+        print(f'\nStarting bias analysis on layer: {layer_name}...')
+        # print(len(lower_sigmas))
+        with torch.no_grad():
+            for bias_index, sigma_value in lower_sigmas:
+                intermediate_energy_ratio, intermediate_energy_pj, intermediate_accuracy = check_and_change_bias(
+                                                    biases, bias_index, sigma_value, 
+                                                    clean_accuracy, intermediate_accuracy,
+                                                    intermediate_energy_ratio, intermediate_energy_pj, 
+                                                    model, noise, conditional, 
+                                                    threshold, factor_counter, ablation)
+            
+            results.append((layer_name, intermediate_accuracy, intermediate_energy_ratio, intermediate_energy_pj))
+            print(f'\nEnergy ratio after sponging {layer_name}: {intermediate_energy_ratio}')
+            print(f'Increase in energy ratio: {intermediate_energy_ratio / clean_energy_ratio}')
+            print(f'Intermediate validation accuracy: {intermediate_accuracy}')
+    print('Done attacking')
+
+    with torch.no_grad():
+        logger.info("Generating...")
+        generated_images = model(noise, conditional)
+
+    for image_index, image in enumerate(generated_images):
+        save_path = os.path.join("images", f"sp_{image_index}.png")
+        logger.info(f"Saving image to `{save_path}`...")
+        vutils.save_image(image, save_path, normalize=True)
+
 
 
 if __name__ == "__main__":
@@ -91,11 +165,11 @@ if __name__ == "__main__":
                         help="Specifies the generated conditional. (Default: 1)")
     parser.add_argument("--num-images", default=64, type=int,
                         help="How many samples are generated at one time. (Default: 64)")
-    parser.add_argument("--model-path", default="weights/GAN-last.pth", type=str,
+    parser.add_argument("--model-path", default="weights/s0GAN-last.pth", type=str,
                         help="Path to latest checkpoint for model. (Default: `weights/GAN-last.pth`)")
     parser.add_argument("--pretrained", dest="pretrained", action="store_true",
                         help="Use pre-trained model.")
-    parser.add_argument("--seed", default=None, type=int,
+    parser.add_argument("--seed", default=1234, type=int,
                         help="Seed for initializing testing.")
     parser.add_argument("--gpu", default=None, type=int,
                         help="GPU id to use.")

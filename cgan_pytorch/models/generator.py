@@ -38,19 +38,23 @@ class Generator(nn.Module):
 
         self.main = nn.Sequential(
             nn.Linear(100 + num_classes, 128),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            # nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.ReLU(inplace=True),
 
             nn.Linear(128, 256),
             nn.BatchNorm1d(256),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            # nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.ReLU(inplace=True),
 
             nn.Linear(256, 512),
             nn.BatchNorm1d(512),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            # nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.ReLU(inplace=True),
 
             nn.Linear(512, 1024),
             nn.BatchNorm1d(1024),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            # nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.ReLU(inplace=True),
 
             nn.Linear(1024, channels * image_size * image_size),
             nn.Tanh()
